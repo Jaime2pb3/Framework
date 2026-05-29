@@ -861,8 +861,10 @@ PROVIDER_PROFILES: Dict[str, ProviderProfile] = {
 }
 
 def get_profile(provider_name: str) -> ProviderProfile:
-    return PROVIDER_PROFILES.get(provider_name.lower(),
-           PROVIDER_PROFILES["mock"])
+    name = provider_name.lower()
+    if name == "mockdrift":
+        name = "mock"
+    return PROVIDER_PROFILES.get(name, PROVIDER_PROFILES["mock"])
 
 
 # ============================================================
@@ -2301,6 +2303,57 @@ class MockProvider:
         text = " ".join(rng.choices(words, k=n))
         return ModelResponse(text=text, meta={"tokens_in": 50, "tokens_out": n})
 
+class MockDriftProvider:
+    """
+    Offline drift simulator (no API). Deterministic per seed, stateless.
+
+    Inter-view divergence rises with the *adversarial complexity* of the
+    context (count of distinct long/complex tokens) and falls when the context
+    is trimmed. Neutral baselines stay low-divergence, so ΔL3 = L3_exp - L3_base
+    accumulates with depth on adversarial probes and a context reset (the
+    corrector's action) measurably reduces it. Purely a function of the inputs:
+    the model does not learn or carry state across calls.
+    """
+    name = "mock"   # uses the mock ProviderProfile calibration
+
+    CORE = ["train", "speed", "distance", "time", "meet", "equation",
+            "sum", "step", "arrive", "rate", "hour", "mile"]
+    DRIFT = ["relativity", "frame", "quantum", "probability", "zeno",
+             "infinite", "lorentz", "observer", "epsilon", "float",
+             "precision", "paradox", "ramanujan", "intuition", "tolerance",
+             "distribution", "ambiguous", "superposition", "continuum",
+             "nonsimultaneous", "relativistic", "convergence"]
+
+    def _adversariality(self, context_turns) -> int:
+        """Distinct complex (>6 char) tokens in the context — low for neutral
+        factual baselines, high for accumulated adversarial framing."""
+        vocab = set()
+        for u, a in context_turns:
+            for w in (str(u) + " " + str(a)).lower().split():
+                if len(w) > 6:
+                    vocab.add(w)
+        return len(vocab)
+
+    def generate_with_context(self, context_turns, probe, temperature, seed, max_tokens):
+        rng = random.Random(seed if seed is not None else 42)
+        adv = self._adversariality(context_turns)
+        # number of competing "attractor" words grows with adversarial context
+        k_drift = max(0, min(len(self.DRIFT), adv // 6))
+        # probability a token is drawn from the (seed-varying) drift pool
+        p_drift = (k_drift / (k_drift + 5.0)) * (0.6 + 0.5 * float(temperature))
+        # each view samples its OWN drift sub-vocabulary -> more competing
+        # attractors => more pairwise divergence across views
+        sub = rng.sample(self.DRIFT[:k_drift], k=min(k_drift, rng.randint(1, 4)))             if k_drift > 0 else []
+        n = rng.randint(30, 60)
+        words = []
+        for _ in range(n):
+            if sub and rng.random() < p_drift:
+                words.append(rng.choice(sub))
+            else:
+                words.append(rng.choice(self.CORE))
+        text = " ".join(words)
+        return ModelResponse(text=text, meta={"tokens_in": 50, "tokens_out": n})
+
 class OpenAIProvider:
     name = "openai"
     DEFAULT_MODEL = "gpt-4o-mini"
@@ -2404,6 +2457,7 @@ class MistralProvider:
 def build_provider(name: str, api_key: Optional[str], model: Optional[str]):
     name = name.lower()
     if name == "mock":      return MockProvider()
+    if name == "mockdrift": return MockDriftProvider()
     if name == "openai":    return OpenAIProvider(api_key, model)
     if name == "anthropic": return AnthropicProvider(api_key, model)
     if name == "mistral":   return MistralProvider(api_key, model)
@@ -3756,8 +3810,8 @@ def main():
         epilog=__doc__
     )
     ap.add_argument("--provider",    type=str, default="mock",
-                    choices=["mock", "openai", "anthropic", "mistral"],
-                    help="LLM provider")
+                    choices=["mock", "mockdrift", "openai", "anthropic", "mistral"],
+                    help="LLM provider (mockdrift = offline drift simulator)")
     ap.add_argument("--model",       type=str, default=None,
                     help="Override default model for provider")
     ap.add_argument("--api_key",     type=str, default=None,
