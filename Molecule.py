@@ -329,6 +329,21 @@ WARN_PERCENTILE_DEFAULT = 0.90   # suggested data-driven WARN = P90 of observed 
 # never fire. Pass --warn_threshold to override the numeric WARN gate; the run
 # also reports the P90-suggested value so the gap is always visible.
 
+# v12.1 — CLOSED-LOOP correction (stateless feedback; the model ACTS on signal,
+# it does NOT learn — no parameter/memory is updated at runtime). Per depth the
+# corrector may re-fire with an escalating action until drift clears or this
+# many attempts are spent.
+MAX_CORRECTION_ATTEMPTS = 3
+
+# v12.1 — precise-moment ("rising-edge") early-warning trigger. Fires the
+# corrector at drift ONSET (accelerating upward) instead of after accumulation.
+# Pure instantaneous signal, no memory. Disable with --no_early_warning.
+EARLY_WARNING_DEFAULT = True
+EARLY_DPT_EPS     = 0.010   # min upward velocity (dPt) for "drift rising"
+EARLY_DDPT_EPS    = 0.020   # min positive acceleration (ddPt) — convex onset
+EARLY_TOP_BAND    = 0.050   # Top surprise level marking a structural shift
+SELF_RECOVERY_EPS = 0.010   # if dPt < -eps the system self-stabilizes -> suppress
+
 
 # ============================================================
 # V11 — Bottom/AntiBottom / Bottomonium constants
@@ -924,9 +939,9 @@ class CharmCorrectorV10:
     Generates N_SCOUT context variants, selects lowest L3.
     """
     def should_activate(self, state: DetectorState) -> bool:
-        idx = BOTTOM_STATES.index(state.bottom.state)
-        threshold_idx = BOTTOM_STATES.index(CORRECTOR_THRESHOLD)
-        return idx >= threshold_idx and state.dominant_flavor == "charm"
+        # v12.1: gating lives in CorrectorModule.should_fire; here we only match
+        # the dominant flavor so early-warning fires use the proper corrector.
+        return state.dominant_flavor == "charm"
 
     def select_context(self,
                        provider,
@@ -998,9 +1013,9 @@ class StrangeCorrectorV10:
     Keeps ANCHOR_KEEP_TURNS most recent turns + exponential decay.
     """
     def should_activate(self, state: DetectorState) -> bool:
-        idx = BOTTOM_STATES.index(state.bottom.state)
-        threshold_idx = BOTTOM_STATES.index(CORRECTOR_THRESHOLD)
-        return idx >= threshold_idx and state.dominant_flavor == "strange"
+        # v12.1: gating lives in CorrectorModule.should_fire; here we only match
+        # the dominant flavor so early-warning fires use the proper corrector.
+        return state.dominant_flavor == "strange"
 
     def reset_context(self,
                       ctx: List[Tuple[str, str]],
@@ -1032,11 +1047,29 @@ class CorrectorModule:
         self.strange_corr    = StrangeCorrectorV10()
         self.engine          = InterventionEngine()
         self.records:        List[Dict] = []
+        # v12.1: precise-moment trigger toggle (overridden by run_probe/CLI).
+        self.early_warning   = EARLY_WARNING_DEFAULT
 
     def should_fire(self, state: DetectorState) -> bool:
-        """PRINCIPLE 1: only fire when Detector confirms ≥ WARN."""
+        """
+        Fire on either of two STATELESS signal conditions:
+          (a) LEVEL trigger  — Detector confirms >= WARN (Principle 1, unchanged).
+          (b) PRECISE-MOMENT — drift is rising AND accelerating (convex onset)
+              with a structural-shift surprise, and a dominant flavor exists.
+        The early trigger is suppressed when the system is self-stabilizing
+        (dPt < 0): we never fight a drift that is already receding.
+        No memory is consulted — only the current state's instantaneous signals.
+        """
         idx = BOTTOM_STATES.index(state.bottom.state)
-        return idx >= BOTTOM_STATES.index(CORRECTOR_THRESHOLD)
+        if idx >= BOTTOM_STATES.index(CORRECTOR_THRESHOLD):
+            return True
+        if not getattr(self, "early_warning", EARLY_WARNING_DEFAULT):
+            return False
+        if state.dPt < -SELF_RECOVERY_EPS:
+            return False
+        rising = (state.dPt > EARLY_DPT_EPS and state.ddPt > EARLY_DDPT_EPS)
+        accel  = (state.surprise > EARLY_TOP_BAND)
+        return bool(rising and accel and state.dominant_flavor is not None)
 
     def activate(self,
                  state: DetectorState,
@@ -1045,13 +1078,34 @@ class CorrectorModule:
                  probe,
                  seed_base: int,
                  max_tokens: int,
-                 delay: float) -> Tuple[List[Tuple[str, str]], Dict]:
+                 delay: float,
+                 level: int = 0) -> Tuple[List[Tuple[str, str]], Dict]:
         """
-        Activate appropriate corrector based on dominant_flavor.
+        Activate the appropriate corrector based on dominant_flavor.
         Returns corrected context + log dict.
+
+        v12.1 escalation ladder (stateless — NOT learning):
+          level 0  -> targeted single-flavor corrector.
+          level>=1 -> progressively harder context reset (keep fewer turns) plus
+                      an explicit "reset completely" corrective turn, regardless
+                      of dominant flavor. This guarantees the loop can keep acting
+                      on a resistant drift until it clears or attempts run out.
         """
         dominant = state.dominant_flavor
-        log = {"dominant": dominant, "bottom_state": state.bottom.state}
+        log = {"dominant": dominant, "bottom_state": state.bottom.state, "level": level}
+
+        if level >= 1:
+            keep = max(0, ANCHOR_KEEP_TURNS - level)
+            truncated = ctx_exp[-keep:] if keep > 0 else []
+            delta_user = self.engine.build_delta_user("top", probe.probe)
+            corr_ctx = truncated + [(
+                delta_user,
+                "Acknowledged. I will reset completely, discard the prior framing, "
+                "preserve only verifiable facts, and answer from scratch."
+            )]
+            log.update({"type": "escalated_reset", "keep_turns": keep,
+                        "delta_user_preview": delta_user[:80]})
+            return corr_ctx, log
 
         if dominant == "charm" and self.charm_corr.should_activate(state):
             probe_id = stable_hash(probe.probe)
@@ -2726,6 +2780,7 @@ def run_probe_v10(
     no_adaptive_temp: bool         = False,
     bottom_weights:  Optional[np.ndarray] = None,   # FIX 🟡: propagación explícita
     warn_threshold:  Optional[float] = None,        # v12: data-driven WARN gate
+    early_warning:   bool = EARLY_WARNING_DEFAULT,  # v12.1: precise-moment trigger
 ) -> Dict:
     """
     V10 pipeline — separated Detector/Corrector.
@@ -2749,6 +2804,7 @@ def run_probe_v10(
                             bottom_weights=bottom_weights,  # FIX 🟡
                             warn_threshold=warn_threshold)  # v12
     corrector    = CorrectorModule(profile=profile)
+    corrector.early_warning = early_warning   # v12.1
     mp_engine    = MomentumPolarizationEngine(profile=profile)
     gm_engine    = GraphMomentumEngine(n_views=views)  # MGMP
     bab_engine   = BottomAntibottomEngine()            # V11 (Γ_CP observable)
@@ -2821,61 +2877,56 @@ def run_probe_v10(
 
         if corrector.should_fire(state):
             correction_fired = True
-            corr_ctx, corr_log = corrector.activate(
-                state, provider, ctx_exp, probe,
-                seed_base, max_tokens, delay)
 
-            corr_type = corr_log.get("type")
-            correction_possible = (corr_ctx != ctx_exp)
-            if corr_type == "strange_reset":
-                detail = corr_log.get("detail", {})
-                correction_possible = bool(detail.get("dropped_turns", 0) > 0)
-                if not correction_possible:
-                    corr_log["type"] = "strange_resample_only"
-                    corr_type = corr_log["type"]
-            elif corr_type == "charm_scout":
-                detail = corr_log.get("detail", {})
-                correction_possible = (corr_ctx != ctx_exp) and bool(detail.get("selected_k", 0) > 0)
-
-            # V11.3 resampling control: same original context, same correction seed.
-            # This isolates correction effect from ordinary stochastic regeneration.
+            # V11.3 resampling control (computed once): same original context,
+            # same correction seed — isolates the correction effect from ordinary
+            # stochastic regeneration.
             texts_exp_resample, meta_er = generate_views(
                 provider, ctx_exp, probe.probe, temperatures,
                 probe_id + "_corr", d_idx, seed_base + 77777,
                 max_tokens, repeats, delay)
             tokens_in_total  += meta_er["tokens_in"]
             tokens_out_total += meta_er["tokens_out"]
-            pt_resample = compute_Pt(texts_exp_resample)
-            pt_base2    = compute_Pt(texts_base)
-            resample_dl3 = round(pt_resample["Pt"] - pt_base2["Pt"], 6)
+            pt_base2     = compute_Pt(texts_base)
+            resample_dl3 = round(compute_Pt(texts_exp_resample)["Pt"] - pt_base2["Pt"], 6)
 
-            if corr_type in ("charm_scout", "strange_reset", "intervention_engine", "strange_resample_only"):
-                # Regenerate on corrected context and re-measure. If no real context
-                # change occurred, this is retained as resampling-only evidence and
-                # is excluded from AntiBottom recovery aggregation.
+            # v12.1: bounded CLOSED-LOOP correction. Stateless feedback controller
+            # — it ACTS on the current signal and re-measures; it does NOT learn
+            # (no parameter/memory is updated across attempts or depths). It
+            # escalates the corrective action until the drift is effectively
+            # corrected or MAX_CORRECTION_ATTEMPTS is reached.
+            attempts: List[Dict] = []
+            best = None
+            for level in range(MAX_CORRECTION_ATTEMPTS):
+                corr_ctx, corr_log = corrector.activate(
+                    state, provider, ctx_exp, probe,
+                    seed_base, max_tokens, delay, level=level)
+
+                corr_type = corr_log.get("type")
+                correction_possible = (corr_ctx != ctx_exp)
+                if corr_type == "strange_reset":
+                    detail = corr_log.get("detail", {})
+                    correction_possible = bool(detail.get("dropped_turns", 0) > 0)
+                    if not correction_possible:
+                        corr_log["type"] = "strange_resample_only"
+                        corr_type = corr_log["type"]
+                elif corr_type == "charm_scout":
+                    detail = corr_log.get("detail", {})
+                    correction_possible = (corr_ctx != ctx_exp) and bool(detail.get("selected_k", 0) > 0)
+
                 texts_exp_corr, meta_ec = generate_views(
                     provider, corr_ctx, probe.probe, temperatures,
-                    probe_id + "corr_branch", d_idx, seed_base + 77777,
+                    probe_id + ("corr_branch_L%d" % level), d_idx, seed_base + 77777,
                     max_tokens, repeats, delay)
                 tokens_in_total  += meta_ec["tokens_in"]
                 tokens_out_total += meta_ec["tokens_out"]
 
-                pt_post  = compute_Pt(texts_exp_corr)
-                post_dl3 = round(pt_post["Pt"] - pt_base2["Pt"], 6)
+                post_dl3 = round(compute_Pt(texts_exp_corr)["Pt"] - pt_base2["Pt"], 6)
                 outcome, eff_delta, eff_signal = classify_effective_recovery(
                     state.delta_l3, resample_dl3, post_dl3, correction_possible)
 
-                state.corrected          = True
-                state.correction_type    = corr_type
-                state.correction_outcome = outcome
-                state.post_delta_l3      = post_dl3
-                state.correction_possible = correction_possible
-                state.resample_control_delta_l3 = resample_dl3
-                state.effective_recovery_delta_l3 = eff_delta
-                state.effective_recovery_signal = eff_signal
-
-                corr_entry = {
-                    "depth_idx": d_idx,
+                rec = {
+                    "depth_idx": d_idx, "level": level,
                     **corr_log,
                     "actual_warn_plus": actual_warn_plus,
                     "correction_possible": correction_possible,
@@ -2885,28 +2936,49 @@ def run_probe_v10(
                     "effective_recovery_signal": eff_signal,
                     "outcome": outcome,
                 }
-                correction_log.append(corr_entry)
-                resample_control_log.append({
-                    "depth_idx": d_idx,
-                    "pre_delta_l3": state.delta_l3,
-                    "resample_control_delta_l3": resample_dl3,
-                    "corrected_delta_l3": post_dl3,
-                    "correction_possible": correction_possible,
-                })
-
-                # V11.3: AntiBottom observes only effective correction branches.
-                bab_engine.observe_correction(state)
+                attempts.append(rec)
+                if best is None or abs(post_dl3) < best["abs"]:
+                    best = {"abs": abs(post_dl3), "type": corr_type,
+                            "post_dl3": post_dl3, "eff_delta": eff_delta,
+                            "eff_signal": eff_signal, "outcome": outcome,
+                            "possible": correction_possible}
 
                 provider_model = getattr(provider, "model", "mock")
                 poss = "real" if correction_possible else "resample-only"
-                print(f"    [CORRECTOR d{d_idx}] "
-                      f"provider={profile.name} model={provider_model} "
-                      f"dominant={corr_log.get('dominant')} type={corr_type} "
-                      f"possible={poss} WARN+={actual_warn_plus} "
-                      f"pre_ΔL3={state.delta_l3:+.4f} | resample_ΔL3={resample_dl3:+.4f} "
-                      f"→ post_ΔL3={post_dl3:+.4f} "
-                      f"eff={eff_delta:+.4f} R_eff={eff_signal:.3f} "
-                      f"outcome={outcome}")
+                print("    [CORRECTOR d%d L%d] provider=%s model=%s "
+                      "dominant=%s type=%s possible=%s WARN+=%s "
+                      "pre_dL3=%+.4f resample_dL3=%+.4f -> post_dL3=%+.4f "
+                      "eff=%+.4f R_eff=%.3f outcome=%s"
+                      % (d_idx, level, profile.name, provider_model,
+                         corr_log.get("dominant"), corr_type, poss, actual_warn_plus,
+                         state.delta_l3, resample_dl3, post_dl3,
+                         eff_delta, eff_signal, outcome))
+
+                # Stop the moment the correction is effective; else escalate.
+                if outcome == "CORRECTED":
+                    break
+
+            # Commit the BEST attempt to the state (one AntiBottom obs per depth).
+            state.corrected            = True
+            state.correction_type      = best["type"]
+            state.correction_outcome   = best["outcome"]
+            state.post_delta_l3        = best["post_dl3"]
+            state.correction_possible  = best["possible"]
+            state.resample_control_delta_l3   = resample_dl3
+            state.effective_recovery_delta_l3 = best["eff_delta"]
+            state.effective_recovery_signal   = best["eff_signal"]
+
+            for rec in attempts:
+                correction_log.append(rec)
+            resample_control_log.append({
+                "depth_idx": d_idx,
+                "pre_delta_l3": state.delta_l3,
+                "resample_control_delta_l3": resample_dl3,
+                "corrected_delta_l3": best["post_dl3"],
+                "correction_possible": best["possible"],
+                "attempts": len(attempts),
+            })
+            bab_engine.observe_correction(state)
 
         # ── 5b. GRAPH MOMENTUM — per-depth, unconditional ────────────────  # MGMP
         gm_state = gm_engine.step(                                              # MGMP
@@ -3265,6 +3337,9 @@ def main():
                          "0.39 is often unreachable; try ~0.25 so the corrector "
                          "can actually fire. The run reports the P90-suggested "
                          "value either way.")
+    ap.add_argument("--no_early_warning", action="store_true", default=False,
+                    help="Disable the precise-moment rising-edge trigger; fire "
+                         "the corrector only on the level (>=WARN) condition.")
     ap.add_argument("--fixed_weights", type=str, default=None,
                     choices=["v4"],
                     help="Use original V4 BOTTOM_WEIGHTS [0.35,0.25,0.10,0.20,0.10] "
@@ -3341,6 +3416,7 @@ def main():
                 fixed_temp=args.fixed_temp,
                 no_adaptive_temp=args.no_adaptive_temp,
                 warn_threshold=args.warn_threshold,
+                early_warning=not args.no_early_warning,
             )
             all_results.append(result)
         except KeyboardInterrupt:
